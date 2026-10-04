@@ -39,7 +39,7 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Apply the skycraft-*.patch files (control mode, world reset, show world, mobs, mob roaming, roaming on rough ground, chat input, mob life - time sync, spawning, noticing NPCs, mob combat - mobs hit NPCs, NPCs draw weapons, player hits mobs in Skyrim controls) if they're in the repo
+      - name: Apply the skycraft-*.patch files (control mode, world reset, show world, mobs, mob roaming, roaming on rough ground, chat input, mob life - time sync, spawning, noticing NPCs, mob combat - mobs hit NPCs, NPCs draw and sheathe, player hits mobs in Skyrim mode) if they're in the repo
         shell: bash
         run: |
           # The docs aren't part of the build, so a change upstream there must not stop it.
@@ -69,7 +69,7 @@ jobs:
           apply_patch skycraft-roaming-bumps.patch SUBSTEP fabric/src/main/java/dev/skycraft/world/SkyNav.java
           apply_patch skycraft-chat-input.patch heldByMinecraft skse/src/Input.cpp
           apply_patch skycraft-mob-life.patch kEvNpcSwing skse/src/Combat.cpp
-          apply_patch skycraft-mob-combat.patch PollPlayerStrike skse/src/Combat.cpp
+          apply_patch skycraft-mob-combat.patch kInSkyrimSwing skse/src/Combat.cpp
 
       # A repo made from "Download ZIP" has no submodule contents. Fetch CommonLibSSE-NG ourselves
       # then (the branch's latest commit, not the exact one the author built with).
@@ -167,6 +167,15 @@ jobs:
             grep -aq "a Minecraft mob hit" skse/build/RelWithDebInfo/SkyCraft.dll \
               && echo "SkyCraft.dll has the mob-hit handling." \
               || { echo "::error::SkyCraft.dll was built without the mob-hit handling."; exit 1; }
+          fi
+
+      - name: Check the mob combat made it into the build
+        shell: bash
+        run: |
+          if [ -f skycraft-mob-combat.patch ] || grep -q kInSkyrimSwing skse/src/Combat.cpp; then
+            grep -aq "Skyrim swing (kind" skse/build/RelWithDebInfo/SkyCraft.dll \
+              && echo "SkyCraft.dll has the Skyrim-mode attacks." \
+              || { echo "::error::SkyCraft.dll was built without the Skyrim-mode attacks."; exit 1; }
           fi
 
       - name: Upload the mod
