@@ -1,0 +1,120 @@
+diff --git a/README.md b/README.md
+index ca88eec..3f349fc 100644
+--- a/README.md
++++ b/README.md
+@@ -153,8 +153,10 @@ Minecraft can't (a scripted scene, a web, a lever, a menu) or just to play Skyri
+ 
+ - The key is `sToggleKey` in `SkyCraft.ini`. `bStartInSkyrimMode = 1` starts every session in
+   Skyrim's mode, which suits Skyrim's scripted opening: play it with Skyrim's controls, then switch.
+-- Blocks you placed aren't drawn in Skyrim's mode (they're still there, and they come back when
+-  you switch), their light is off, and NPCs don't path around them.
++- Minecraft's world is still drawn in Skyrim's mode: your blocks, mobs, dropped items, arrows,
++  chests and particles, with the blocks' light. Only Minecraft's hand, HUD and block outline are
++  left out. They're for looking at, not touching: Skyrim's player and NPCs walk through the blocks
++  in this mode (they're solid again when you switch back).
+ - Damage you take in Skyrim's mode is plain Skyrim damage, and it's healed when you switch back
+   (Minecraft's own health is held full meanwhile).
+ - Neither direction works while a Skyrim menu is open, and you can't switch *to* Skyrim's mode
+diff --git a/docs/DESIGN.md b/docs/DESIGN.md
+index 09bc863..a604c28 100644
+--- a/docs/DESIGN.md
++++ b/docs/DESIGN.md
+@@ -120,7 +120,7 @@ Later: a Mixin on fluid-state queries reports `water` inside Skyrim water volume
+   - **Gameplay:** input goes to MC. Skyrim receives only a small allow-list: Esc for the Skyrim journal/system menu, and the Skyrim "Activate" route described below.
+   - **MC screen open** (inventory, crafting, chest): input goes to MC and the MC cursor is shown in the overlay.
+   - **Skyrim menu open** (dialogue, barter, lockpicking, map, loading screen): input goes to Skyrim and the MC client is frozen.
+-  - **Skyrim control mode** (the player's toggle key, `SkyCraft.ini` `[Controls]`): a takeover like the furniture and mount ones, except the player ends it. Skyrim gets the controls, camera and HUD; MC gets no input and draws no overlay or blocks. SkyState carries `kSkyrimControl`, and MC's player is moved to Skyrim's every tick (and kept at full health) instead of being left behind, so switching back needs no teleport beyond the usual resync.
++  - **Skyrim control mode** (the player's toggle key, `SkyCraft.ini` `[Controls]`): a takeover like the furniture and mount ones, except the player ends it. Skyrim gets the controls, camera and HUD; MC gets no input and draws no overlay (hand, HUD, screens). Its world layer (blocks, mobs, items, particles) is still drawn into Skyrim's frame, from Skyrim's camera, as for the puppet case. SkyState carries `kSkyrimControl`, and MC's player is moved to Skyrim's every tick (and kept at full health) instead of being left behind, so switching back needs no teleport beyond the usual resync.
+ - **"Use" arbitration:** when you press MC's use key, both sides pick a target:
+   - MC's ray pick (blocks and actor proxies)
+   - Skyrim's crosshair pick (doors, containers, NPCs to talk to, items)
+diff --git a/skse/src/Game.cpp b/skse/src/Game.cpp
+index 45ac4e8..681f9ed 100644
+--- a/skse/src/Game.cpp
++++ b/skse/src/Game.cpp
+@@ -717,6 +717,8 @@ namespace skycraft
+ 				logger::info("puppet {}", puppet ? "on (Minecraft drives the player)" : "off");
+ 			}
+ 			st.puppeting = puppet;
++			// Skyrim's mode still shows Minecraft's world (blocks, mobs, items); not while loading or dead.
++			st.worldVisible = puppet || (skyrimMode && haveMc && st.mcInWorld && !loading && !a_player->IsDead());
+ 			if (puppet) {
+ 				EnsureControlsEnabled();
+ 				Game::NoteFrameStep('P');
+@@ -1085,8 +1087,7 @@ namespace skycraft
+ 			const McVec lightCentre = puppet ? McVec{ mc.x, mc.y, mc.z } : skyMc;
+ 			{
+ 				Perf::Scope timer(Perf::kLights);
+-				// (Not in Skyrim's mode: the blocks aren't drawn then, so their light would come from nothing.)
+-				BlockLights::Update(!skyrimMode && haveMc && st.mcInWorld && !loading && cell ? &lightCentre : nullptr, a_delta);
++				BlockLights::Update(haveMc && st.mcInWorld && !loading && cell ? &lightCentre : nullptr, a_delta);
+ 			}
+ 
+ 			// Blocks dug out of Skyrim's world: its collision around them goes to Minecraft again, and
+diff --git a/skse/src/Game.h b/skse/src/Game.h
+index 5cd943b..00a36a0 100644
+--- a/skse/src/Game.h
++++ b/skse/src/Game.h
+@@ -22,6 +22,11 @@ namespace skycraft
+ 		// frame, and Minecraft's player just follows Skyrim's. Set by the toggle (or SkyCraft.ini
+ 		// bStartInSkyrimMode), applied by the per-frame update as a takeover that never ends by itself.
+ 		std::atomic<bool> skyrimMode{ false };
++		// Minecraft's world things (placed blocks, mobs, dropped items, arrows, particles, chests, ...) are
++		// drawn into Skyrim's frame: while Minecraft drives the player (puppeting), and also in Skyrim's
++		// control mode, where Minecraft's player only follows Skyrim's but its world is still there to see.
++		// (Not Minecraft's hand, HUD or screens, which are the overlay's and stay off in Skyrim's mode.)
++		std::atomic<bool> worldVisible{ false };
+ 		// A Minecraft world reset (the reset key, Input.cpp): 0 none, 1 asked and waiting for Minecraft
+ 		// to say it's on it, 2 Minecraft is throwing its world away and loading a fresh one. The
+ 		// per-frame update (Game.cpp) runs it: Skyrim's own controls until Minecraft has its world back.
+diff --git a/skse/src/WorldRender.cpp b/skse/src/WorldRender.cpp
+index b877ae5..b13721c 100644
+--- a/skse/src/WorldRender.cpp
++++ b/skse/src/WorldRender.cpp
+@@ -1324,7 +1324,9 @@ float4 OverlayPS(float4 pos : SV_Position) : SV_Target
+ 
+ 		void BuildOutline(const double a_o[3])
+ 		{
+-			if (!entities.hasSelection) {
++			// (Not in Skyrim's mode: Minecraft's crosshair isn't aimed anywhere there, so it would outline some
++			// block that has nothing to do with where Skyrim's player is looking.)
++			if (!entities.hasSelection || State().skyrimMode) {
+ 				return;
+ 			}
+ 			constexpr float g = 0.002f;
+@@ -1991,7 +1993,7 @@ float4 OverlayPS(float4 pos : SV_Position) : SV_Target
+ 		void CaptureSunShadows(RE::BSShadowLight* a_sun)
+ 		{
+ 			auto* renderer = RE::BSGraphics::Renderer::GetSingleton();
+-			if (!device || !renderer || !a_sun || !State().puppeting) {
++			if (!device || !renderer || !a_sun || !State().worldVisible) {
+ 				return;
+ 			}
+ 			auto& descs = a_sun->GetRuntimeData().shadowmapDescriptors;
+@@ -2901,7 +2903,7 @@ float4 OverlayPS(float4 pos : SV_Position) : SV_Target
+ 				Game::NoteFrameStep('D');
+ 				Game::NoteRenderedCamera(camera->world.translate, camera->world.rotate);
+ 			}
+-			if (!device || !atlasSrv || !inFrameEnabled || !camera || !renderer || !st.puppeting || st.skyrimMenuOpen || !depthKnown || !depthUsable) {
++			if (!device || !atlasSrv || !inFrameEnabled || !camera || !renderer || !st.worldVisible || st.skyrimMenuOpen || !depthKnown || !depthUsable) {
+ 				return;
+ 			}
+ 			Link::Get().ReadWorldEntities(entities);
+@@ -3048,7 +3050,7 @@ float4 OverlayPS(float4 pos : SV_Position) : SV_Target
+ 			static void thunk(void* a_1, void* a_2, void* a_3, std::uint32_t a_4)
+ 			{
+ 				static int logged = 0;
+-				if (logged < 1 && State().puppeting && device) {
++				if (logged < 1 && State().worldVisible && device) {
+ 					++logged;
+ 					if (auto* renderer = RE::BSGraphics::Renderer::GetSingleton()) {
+ 						auto&                   rd = renderer->GetRuntimeData();
+@@ -3217,7 +3219,7 @@ float4 OverlayPS(float4 pos : SV_Position) : SV_Target
+ 
+ 			auto& st = State();
+ 			auto* camera = RE::Main::WorldRootCamera();
+-			if (!camera || !st.puppeting || st.skyrimMenuOpen || !atlasSrv) {
++			if (!camera || !st.worldVisible || st.skyrimMenuOpen || !atlasSrv) {
+ 				return;
+ 			}
+ 

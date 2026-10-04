@@ -1,0 +1,618 @@
+diff --git a/README.md b/README.md
+index ca88eec..b468fdf 100644
+--- a/README.md
++++ b/README.md
+@@ -139,6 +139,7 @@ Minecraft has priority. These keys still go to Skyrim:
+ | **~** | Skyrim console |
+ | **O** | Minecraft pause / options menu |
+ | **F8** | Switch between Minecraft's controls and Skyrim's own (configurable, see below) |
++| **F7** | Reset the Minecraft world: every block built or dug is removed (press twice; configurable, see below) |
+ 
+ Every other key is Minecraft's: **E** inventory, **F5** camera, **T** chat, **/** commands,
+ **Shift** crouch/sneak, and so on.
+@@ -161,6 +162,25 @@ Minecraft can't (a scripted scene, a web, a lever, a menu) or just to play Skyri
+   with a Minecraft screen (inventory, chat) open.
+ - It's keyboard-only for now, like the rest of SkyCraft's input.
+ 
++### Resetting the Minecraft world
++
++Blocks you build and dig stay in the one Minecraft world however far Skyrim takes you afterwards, so
++after a loading screen (a door, fast travel) they're left floating in the void somewhere else, or
++buried where an interior happens to share their coordinates. Press **F7** to clear them all.
++
++- It asks first: **F7** shows a message, and **F7** again within 6 seconds does it. The key is
++  `sResetKey` in `SkyCraft.ini` (`None` switches it off).
++- Skyrim's controls take over while Minecraft closes its world, deletes the blocks and opens it
++  again (a few seconds), then you're back on Minecraft's controls, or Skyrim's if that's where you
++  were. You don't need to reload anything in Skyrim.
++- What's removed: every block you placed, every hole you dug into Skyrim's ground and walls (Skyrim's
++  own geometry is back), and loose items and arrows lying around. What stays: your inventory,
++  armour, health and experience, and Minecraft's settings.
++- It resets the whole world, not just the place you're standing, so anything you want to keep
++  building on is gone too.
++- It only works in your own world. In a friend's world, or while friends are in yours, it does
++  nothing, since it would throw them out.
++
+ ## Known limitations
+ 
+ - If something goes wrong, `Documents\My Games\Skyrim Special Edition\SKSE\SkyCraft.log` says what.
+@@ -183,7 +203,8 @@ Minecraft can't (a scripted scene, a web, a lever, a menu) or just to play Skyri
+   again (see [Skyrim's own controls](#skyrims-own-controls)).
+ - Sign text isn't drawn yet.
+ - All Skyrim interiors share one Minecraft world, so blocks placed in one interior can appear in
+-  another at the same coordinates.
++  another at the same coordinates. Press **F7** to start the Minecraft world over (see
++  [Resetting the Minecraft world](#resetting-the-minecraft-world)).
+ - Multiplayer syncs only the Minecraft world. Each player has their own Skyrim, and guests
+   can't hit their own Skyrim NPCs yet.
+ - Mods that also take over the camera (Improved Camera SE, SmoothCam, True Directional Movement)
+diff --git a/docs/DESIGN.md b/docs/DESIGN.md
+index 09bc863..e561ac8 100644
+--- a/docs/DESIGN.md
++++ b/docs/DESIGN.md
+@@ -121,6 +121,7 @@ Later: a Mixin on fluid-state queries reports `water` inside Skyrim water volume
+   - **MC screen open** (inventory, crafting, chest): input goes to MC and the MC cursor is shown in the overlay.
+   - **Skyrim menu open** (dialogue, barter, lockpicking, map, loading screen): input goes to Skyrim and the MC client is frozen.
+   - **Skyrim control mode** (the player's toggle key, `SkyCraft.ini` `[Controls]`): a takeover like the furniture and mount ones, except the player ends it. Skyrim gets the controls, camera and HUD; MC gets no input and draws no overlay or blocks. SkyState carries `kSkyrimControl`, and MC's player is moved to Skyrim's every tick (and kept at full health) instead of being left behind, so switching back needs no teleport beyond the usual resync.
++  - **World reset** (the reset key, `SkyCraft.ini` `[Controls]` `sResetKey`, pressed twice): Skyrim sends `kInResetWorld`; MC answers with `kMcResetting` in McState, and while that is set Skyrim holds the player in Skyrim control mode (restoring MC control afterwards if that's where it was). MC closes its integrated server, deletes the world's `region`, `entities` and `poi` folders (the blocks, the dug-cell attachment and entities; `level.dat` and the player's data stay) and opens the world again from `MirrorWorld.openWhenReady`. The fresh `ClientLevel` makes `WorldExporter` send `kRenClearAll`, which empties Skyrim's copies of the blocks, lights and dug cells. It's refused in a friend's world and with other players in the host's, and clears the flag when the player is back in a world.
+ - **"Use" arbitration:** when you press MC's use key, both sides pick a target:
+   - MC's ray pick (blocks and actor proxies)
+   - Skyrim's crosshair pick (doors, containers, NPCs to talk to, items)
+diff --git a/fabric/src/client/java/dev/skycraft/client/InputBridge.java b/fabric/src/client/java/dev/skycraft/client/InputBridge.java
+index 929e5c4..8dd80ba 100644
+--- a/fabric/src/client/java/dev/skycraft/client/InputBridge.java
++++ b/fabric/src/client/java/dev/skycraft/client/InputBridge.java
+@@ -63,6 +63,7 @@ public final class InputBridge {
+ 			}
+ 			case Proto.IN_RELEASE_ALL -> releaseAll();
+ 			case Proto.IN_HURT -> hurt(minecraft, code, a / 100.0F, b, c);
++			case Proto.IN_RESET_WORLD -> MirrorWorld.requestReset(minecraft);
+ 			case Proto.IN_OPEN_MENU -> {
+ 				if (minecraft.gui.screen() == null && minecraft.player != null) {
+ 					releaseAll();
+diff --git a/fabric/src/client/java/dev/skycraft/client/MirrorWorld.java b/fabric/src/client/java/dev/skycraft/client/MirrorWorld.java
+index dfda99f..9db1067 100644
+--- a/fabric/src/client/java/dev/skycraft/client/MirrorWorld.java
++++ b/fabric/src/client/java/dev/skycraft/client/MirrorWorld.java
+@@ -1,6 +1,18 @@
+ package dev.skycraft.client;
+ 
+ import dev.skycraft.SkyCraft;
++import dev.skycraft.world.SkyDig;
++import java.io.IOException;
++import java.nio.channels.FileChannel;
++import java.nio.channels.FileLock;
++import java.nio.channels.OverlappingFileLockException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
++import java.util.Comparator;
++import java.util.List;
++import java.util.Set;
++import java.util.stream.Stream;
+ import net.minecraft.client.Minecraft;
+ import net.minecraft.client.gui.screens.TitleScreen;
+ import net.minecraft.core.registries.Registries;
+@@ -24,6 +36,23 @@ public final class MirrorWorld {
+ 	// Shown in chat once the player is in a world again (why they're back in their own, ...).
+ 	private static @org.jspecify.annotations.Nullable String pendingNote;
+ 
++	// ---- world reset (the reset key: Skyrim sends Proto.IN_RESET_WORLD) -----------------------
++	// 0 none; 1 asked: Skyrim is told (Proto.MC_RESETTING) and given a few frames to put the player
++	// on its own controls; 2 the world is closed and its saved chunks are being deleted; 3 the world
++	// is opened again and we're waiting for the player to be back in it.
++	private static int resetStage;
++	private static boolean resetClosing;
++	private static int resetFrames;
++	private static int resetTries;
++	private static boolean resetWarned;
++	private static long resetSince;
++	private static @org.jspecify.annotations.Nullable String resetNote;
++	// A chunk's blocks, its dug Skyrim cells (an attachment on the chunk), and the entities and points
++	// of interest around it, are all saved per chunk in folders with these names. Everything else in
++	// the world's folder (the player and their inventory, level.dat, settings) stays.
++	private static final Set<String> CHUNK_FOLDERS = Set.of("region", "entities", "poi");
++	private static final Set<String> KEEP_FOLDERS = Set.of("datapacks", "players", "playerdata", "advancements", "stats", "resources");
++
+ 	private MirrorWorld() {
+ 	}
+ 
+@@ -96,12 +125,185 @@ public final class MirrorWorld {
+ 
+ 	/** Every client tick: a note for the player once they're in a world again. */
+ 	public static void tick(Minecraft minecraft) {
++		tickReset(minecraft);
+ 		if (pendingNote != null && minecraft.player != null) {
+ 			minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(pendingNote));
+ 			pendingNote = null;
+ 		}
+ 	}
+ 
++	/** Whether a world reset is under way (SkyClient tells Skyrim, which keeps the player on its own controls). */
++	public static boolean resetting() {
++		return resetStage != 0;
++	}
++
++	/** After each frame that went out to Skyrim: it has had a look at {@link #resetting()} by now. */
++	public static void frameShown() {
++		if (resetStage == 1) {
++			resetFrames++;
++		}
++	}
++
++	/**
++	 * The reset key: throw this world's blocks away (everything built, everything dug, everywhere) and
++	 * open it again fresh, with the player and their inventory as they were. Blocks the player built
++	 * stay in the one Minecraft world however far Skyrim has taken them since, so they end up floating
++	 * in the void of another place; this is how to get rid of them.
++	 */
++	public static void requestReset(Minecraft minecraft) {
++		if (resetStage != 0) {
++			return;
++		}
++		var server = minecraft.getSingleplayerServer();
++		if (server == null || minecraft.level == null || minecraft.player == null) {
++			SkyCraft.LOG.info("SkyCraft: world reset asked, but this isn't our own world (a friend's, or none is open); ignoring it");
++			return;
++		}
++		if (server.getPlayerList().getPlayers().size() > 1) {
++			SkyCraft.LOG.info("SkyCraft: world reset asked, but friends are in this world; ignoring it");
++			return;
++		}
++		resetStage = 1;
++		resetClosing = false;
++		resetFrames = 0;
++		resetSince = System.currentTimeMillis();
++		SkyCraft.LOG.info("SkyCraft: world reset asked; giving Skyrim a moment to take the player");
++	}
++
++	private static void tickReset(Minecraft minecraft) {
++		switch (resetStage) {
++			case 1 -> {
++				// A few frames with MC_RESETTING out to Skyrim first: closing the world stalls this
++				// thread for a moment, and Skyrim should already have the player by then.
++				if (!resetClosing && (resetFrames >= 3 || System.currentTimeMillis() - resetSince > 2000)) {
++					resetClosing = true;
++					// Like /join: from Minecraft's task queue, not from inside a tick.
++					minecraft.execute(() -> closeWorldForReset(minecraft));
++				}
++			}
++			case 2 -> deleteSavedChunks(minecraft);
++			case 3 -> {
++				long waited = System.currentTimeMillis() - resetSince;
++				boolean back = minecraft.level != null && minecraft.player != null;
++				if (back && (minecraft.gui.screen() == null || waited > 8000)) {
++					resetStage = 0;
++					pendingNote = resetNote != null ? resetNote : "World reset: everything built or dug is gone.";
++					resetNote = null;
++					SkyCraft.LOG.info("SkyCraft: world reset done");
++				} else if (waited > 120_000) {
++					resetStage = 0;
++					SkyCraft.LOG.warn("SkyCraft: world reset: the world didn't open again in two minutes; giving up waiting");
++				}
++			}
++			default -> {
++			}
++		}
++	}
++
++	private static void closeWorldForReset(Minecraft minecraft) {
++		resetClosing = false;
++		if (resetStage != 1) {
++			return;
++		}
++		resetNote = null;
++		resetWarned = false;
++		resetTries = 0;
++		attempted = true;  // openWhenReady leaves the title screen alone until the saved chunks are gone
++		SkyDig.wallsChanged();  // walls worked out from the old world's dug cells mean nothing now
++		SkyCraft.LOG.info("SkyCraft: world reset: closing the world");
++		minecraft.disconnectFromWorld(net.minecraft.client.multiplayer.ClientLevel.DEFAULT_QUIT_MESSAGE);
++		minecraft.gui.setScreen(new TitleScreen());
++		resetStage = 2;
++		resetSince = System.currentTimeMillis();
++	}
++
++	/** Stage 2, every tick until done: wait for the world's server to let go of its files, then clear the chunks. */
++	private static void deleteSavedChunks(Minecraft minecraft) {
++		if (resetTries++ % 10 != 0) {
++			return;  // twice a second is plenty
++		}
++		long waited = System.currentTimeMillis() - resetSince;
++		Path world = minecraft.gameDirectory.toPath().resolve("saves").resolve(SkyCraft.WORLD_NAME);
++		if (!Files.isDirectory(world)) {
++			SkyCraft.LOG.warn("SkyCraft: world reset: no world folder at {}; nothing to clear", world);
++			resetNote = "Couldn't find the world's folder, so nothing was reset.";
++			reopenAfterReset();
++			return;
++		}
++		if (waited < 60_000 && !worldFree(world)) {
++			return;  // the integrated server is still saving and shutting down
++		}
++		try {
++			int removed = clearChunkFolders(world);
++			SkyCraft.LOG.info("SkyCraft: world reset: removed {} saved chunk files", removed);
++			reopenAfterReset();
++		} catch (IOException e) {
++			if (waited < 60_000) {
++				if (!resetWarned) {
++					resetWarned = true;
++					SkyCraft.LOG.warn("SkyCraft: world reset: couldn't clear the world's chunks yet ({}); trying again", e.toString());
++				}
++				return;
++			}
++			SkyCraft.LOG.error("SkyCraft: world reset: couldn't clear the world's chunks", e);
++			resetNote = "Couldn't reset the world (its files were in use). Close other programs using it and try again.";
++			reopenAfterReset();
++		}
++	}
++
++	private static void reopenAfterReset() {
++		SkyDig.wallsChanged();
++		attempted = false;  // openWhenReady opens the world from the title screen, as at startup
++		resetStage = 3;
++		resetSince = System.currentTimeMillis();
++	}
++
++	/** The world's server holds session.lock until it has finished shutting down. */
++	private static boolean worldFree(Path world) {
++		Path lock = world.resolve("session.lock");
++		if (!Files.exists(lock)) {
++			return true;
++		}
++		try (FileChannel channel = FileChannel.open(lock, StandardOpenOption.WRITE); FileLock held = channel.tryLock()) {
++			return held != null;
++		} catch (OverlappingFileLockException | IOException e) {
++			return false;
++		}
++	}
++
++	/** Empties the region, entities and poi folders anywhere in the world's folder; returns how many files went. */
++	private static int clearChunkFolders(Path world) throws IOException {
++		List<Path> folders;
++		try (Stream<Path> walk = Files.walk(world)) {
++			folders = walk.filter(p -> isChunkFolder(world, p)).toList();
++		}
++		int removed = 0;
++		for (Path folder : folders) {
++			List<Path> inside;
++			try (Stream<Path> walk = Files.walk(folder)) {
++				inside = walk.filter(p -> !p.equals(folder)).sorted(Comparator.reverseOrder()).toList();  // files before their folders
++			}
++			for (Path path : inside) {
++				if (Files.deleteIfExists(path)) {
++					removed++;
++				}
++			}
++		}
++		return removed;
++	}
++
++	private static boolean isChunkFolder(Path world, Path path) {
++		if (path.equals(world) || !Files.isDirectory(path) || !CHUNK_FOLDERS.contains(path.getFileName().toString())) {
++			return false;
++		}
++		for (Path part : world.relativize(path)) {
++			if (KEEP_FOLDERS.contains(part.toString())) {
++				return false;
++			}
++		}
++		return true;
++	}
++
+ 	public static void openWhenReady(Minecraft minecraft) {
+ 		// Couldn't reach a friend's world, or it closed under us: back to our own, and say why.
+ 		if (minecraft.gui.screen() instanceof net.minecraft.client.gui.screens.DisconnectedScreen && minecraft.level == null) {
+diff --git a/fabric/src/client/java/dev/skycraft/client/SkyClient.java b/fabric/src/client/java/dev/skycraft/client/SkyClient.java
+index a22d1df..6d027b4 100644
+--- a/fabric/src/client/java/dev/skycraft/client/SkyClient.java
++++ b/fabric/src/client/java/dev/skycraft/client/SkyClient.java
+@@ -420,12 +420,16 @@ public final class SkyClient {
+ 		if (minecraft.gui.screen() != null) {
+ 			flags |= Proto.MC_SCREEN_OPEN;
+ 		}
++		if (MirrorWorld.resetting()) {
++			flags |= Proto.MC_RESETTING;  // the reset key: Skyrim keeps the player on its own controls meanwhile
++		}
+ 		mc.flags = flags;
+ 		mc.sensitivity = minecraft.options.sensitivity().get().floatValue();
+ 		mc.teleportAck = holdPos == null ? teleportAck : teleportAck - 1; // not "arrived" until we are released
+ 		mc.guiScale = minecraft.getWindow().getGuiScale();
+ 		mc.frameCounter = ++frameCounter;
+ 		SkyLink.writeMcState(mc);
++		MirrorWorld.frameShown();
+ 
+ 		if ((flags & Proto.MC_IN_WORLD) != 0) {
+ 			try {
+diff --git a/fabric/src/main/java/dev/skycraft/link/Proto.java b/fabric/src/main/java/dev/skycraft/link/Proto.java
+index 1f1fb51..3453c77 100644
+--- a/fabric/src/main/java/dev/skycraft/link/Proto.java
++++ b/fabric/src/main/java/dev/skycraft/link/Proto.java
+@@ -8,7 +8,7 @@ public final class Proto {
+ 	}
+ 
+ 	public static final int MAGIC = 0x43594B53;
+-	public static final int VERSION = 12;
++	public static final int VERSION = 13;
+ 	// A second client on the same PC (multiplayer testing) talks to its own stand-in Skyrim:
+ 	// -Dskycraft.link=Local\SkyCraft_guest (see tools/fake_guest.py).
+ 	public static final String MAPPING_NAME = System.getProperty("skycraft.link", "Local\\SkyCraft_v1");
+@@ -40,6 +40,7 @@ public final class Proto {
+ 	// Input types added in v5
+ 	public static final int IN_HURT = 7;
+ 	public static final int IN_OPEN_MENU = 8;
++	public static final int IN_RESET_WORLD = 9;
+ 	public static final int HURT_MELEE = 0;
+ 	public static final int HURT_PROJECTILE = 1;
+ 	public static final int HURT_MAGIC = 2;
+@@ -190,6 +191,7 @@ public final class Proto {
+ 	public static final int MC_DEAD = 1 << 5;
+ 	public static final int MC_SWIMMING = 1 << 6;
+ 	public static final int MC_FLYING = 1 << 7;
++	public static final int MC_RESETTING = 1 << 8;
+ 
+ 	// Overlay
+ 	public static final long OC_STATE = 0x00;
+diff --git a/protocol/skycraft_protocol.h b/protocol/skycraft_protocol.h
+index 9eddf41..0f2142b 100644
+--- a/protocol/skycraft_protocol.h
++++ b/protocol/skycraft_protocol.h
+@@ -13,7 +13,7 @@
+ namespace skycraft::proto
+ {
+ 	inline constexpr std::uint32_t kMagic = 0x43594B53;  // "SKYC"
+-	inline constexpr std::uint32_t kVersion = 12;
++	inline constexpr std::uint32_t kVersion = 13;
+ 	inline constexpr wchar_t       kMappingName[] = L"Local\\SkyCraft_v1";
+ 
+ 	// 1 Minecraft block == 70 Skyrim units (Skyrim player ~128 units tall, MC player 1.8 blocks).
+@@ -102,6 +102,8 @@ namespace skycraft::proto
+ 		kMcDead = 1u << 5,
+ 		kMcSwimming = 1u << 6,
+ 		kMcFlying = 1u << 7,
++		kMcResetting = 1u << 8,  // MC is throwing its world away and loading a fresh one (kInResetWorld); Skyrim
++		                         // keeps the player on its own controls until this clears and MC is in a world again
+ 	};
+ 
+ 	struct McState
+@@ -182,6 +184,7 @@ namespace skycraft::proto
+ 		kInReleaseAll = 6,   // release every held key/button (input focus left MC)
+ 		kInHurt = 7,         // Skyrim hit the player: code = HurtKind, a = Skyrim damage * 100, b = attacker FormID, c = HurtFlags
+ 		kInOpenMenu = 8,     // open Minecraft's pause/options menu
++		kInResetWorld = 9,   // throw Minecraft's world away (every block built or dug) and load a fresh one
+ 	};
+ 
+ 	enum HurtKind : std::uint16_t
+diff --git a/skse/SkyCraft.ini b/skse/SkyCraft.ini
+index 03c78a2..a0b7b5c 100644
+--- a/skse/SkyCraft.ini
++++ b/skse/SkyCraft.ini
+@@ -28,6 +28,13 @@ sToggleKey = F8
+ ; for playing through Skyrim's scripted opening, then switching over.
+ bStartInSkyrimMode = 0
+ 
++; The key that resets the Minecraft world: every block you built or dug is removed, so nothing is left
++; floating where Skyrim has moved on (through a door, fast travel). Press it twice within 6 seconds to
++; confirm. Skyrim's controls take over for the few seconds it takes, then you're back where you were.
++; Your inventory and health stay. Same key names as sToggleKey, and it can't be the same key as that.
++; None switches it off.
++sResetKey = F7
++
+ [Debug]
+ ; Detailed timing, camera, combat and lighting logs in SkyCraft.log (several lines a second), for
+ ; reporting problems. 0 = off.
+diff --git a/skse/src/Game.cpp b/skse/src/Game.cpp
+index fa5f507..45ac4e8 100644
+--- a/skse/src/Game.cpp
++++ b/skse/src/Game.cpp
+@@ -4,6 +4,8 @@
+ #include "Dig.h"
+ #include "Perf.h"
+ 
++#include <chrono>
++
+ namespace skycraft
+ {
+ 	Runtime& State()
+@@ -612,6 +614,51 @@ namespace skycraft
+ 				st.pitch = std::clamp(st.pitch + dy * factor, -90.0f, 90.0f);
+ 			}
+ 
++			// A Minecraft world reset (Input.cpp asks, Minecraft does it): Skyrim's own controls while
++			// Minecraft's world is thrown away and loaded again, then back to Minecraft's if that's where
++			// the player was. Minecraft says what it's doing with kMcResetting, so this follows it.
++			{
++				using Clock = std::chrono::steady_clock;
++				constexpr auto       kAnswerTimeout = std::chrono::seconds(5);   // Minecraft says it's on it
++				constexpr auto       kResetTimeout = std::chrono::seconds(120);  // and has its new world
++				static bool          restoreMinecraft = false;
++				static int           seenPhase = 0;
++				static Clock::time_point since{};
++				const auto enter = [&](int a_phase) {
++					st.worldReset = a_phase;
++					seenPhase = a_phase;
++					since = Clock::now();
++				};
++				const int phase = st.worldReset;
++				const bool mcResetting = haveMc && (mc.flags & proto::kMcResetting);
++				if (phase != seenPhase) {
++					seenPhase = phase;
++					since = Clock::now();  // the key press just set phase 1
++				}
++				const auto waited = Clock::now() - since;
++				if (phase != 2 && mcResetting) {
++					restoreMinecraft = !st.skyrimMode;
++					st.skyrimMode = true;
++					enter(2);
++					logger::info("world reset: Minecraft is starting over; Skyrim's controls until it's back");
++				} else if (phase == 1 && waited > kAnswerTimeout) {
++					enter(0);
++					logger::warn("world reset: Minecraft didn't start one");
++					RE::SendHUDMessage::ShowHUDMessage("SkyCraft: the world reset didn't start (Minecraft is in a friend's world, or didn't answer).");
++				} else if (phase == 2 && haveMc && !mcResetting && st.mcInWorld) {
++					enter(0);
++					if (restoreMinecraft) {
++						st.skyrimMode = false;
++					}
++					logger::info("world reset: done; {}'s controls", restoreMinecraft ? "Minecraft" : "Skyrim");
++					RE::SendHUDMessage::ShowHUDMessage("SkyCraft: Minecraft world reset.");
++				} else if (phase == 2 && waited > kResetTimeout) {
++					enter(0);
++					logger::warn("world reset: Minecraft hasn't come back with a world; staying on Skyrim's controls");
++					RE::SendHUDMessage::ShowHUDMessage("SkyCraft: the world reset is taking too long. Staying on Skyrim's controls.");
++				}
++			}
++
+ 			// The player's own switch to Skyrim's controls (Input.cpp) is a takeover too, one that doesn't
+ 			// end by itself: Skyrim gets the controls, the camera and the HUD, Minecraft's input stops, and
+ 			// Minecraft's player follows Skyrim's (kSkyrimControl below). Say which mode it is when it changes.
+diff --git a/skse/src/Game.h b/skse/src/Game.h
+index a979259..5cd943b 100644
+--- a/skse/src/Game.h
++++ b/skse/src/Game.h
+@@ -22,6 +22,10 @@ namespace skycraft
+ 		// frame, and Minecraft's player just follows Skyrim's. Set by the toggle (or SkyCraft.ini
+ 		// bStartInSkyrimMode), applied by the per-frame update as a takeover that never ends by itself.
+ 		std::atomic<bool> skyrimMode{ false };
++		// A Minecraft world reset (the reset key, Input.cpp): 0 none, 1 asked and waiting for Minecraft
++		// to say it's on it, 2 Minecraft is throwing its world away and loading a fresh one. The
++		// per-frame update (Game.cpp) runs it: Skyrim's own controls until Minecraft has its world back.
++		std::atomic<int> worldReset{ 0 };
+ 		// MC reports its player is in a world (overlay should be drawn).
+ 		std::atomic<bool> mcInWorld{ false };
+ 
+diff --git a/skse/src/Input.cpp b/skse/src/Input.cpp
+index 98df7d7..854647c 100644
+--- a/skse/src/Input.cpp
++++ b/skse/src/Input.cpp
+@@ -3,6 +3,7 @@
+ #include <SimpleIni.h>
+ 
+ #include <cctype>
++#include <chrono>
+ #include <cstdlib>
+ #include <string>
+ 
+@@ -111,7 +112,12 @@ namespace skycraft
+ 			if (a_skyrimMenuOpen) {
+ 				return;  // a Skyrim menu has all the input
+ 			}
+-			auto&      st = State();
++			auto& st = State();
++			if (st.worldReset != 0) {
++				// Skyrim's controls are what holds the player while Minecraft's world is away.
++				RE::SendHUDMessage::ShowHUDMessage("SkyCraft: wait for the world reset to finish.");
++				return;
++			}
+ 			const bool toSkyrim = !st.skyrimMode;
+ 			// A Minecraft screen (inventory, chat, ...) can't be seen or used in Skyrim's mode. Going back
+ 			// is always allowed, so a screen Minecraft opened by itself can't lock the player out.
+@@ -124,6 +130,46 @@ namespace skycraft
+ 			logger::info("controls: {}", toSkyrim ? "Skyrim's" : "Minecraft's");
+ 		}
+ 
++		// The key that throws Minecraft's world away (SkyCraft.ini [Controls] sResetKey): every block
++		// built or dug, everywhere, so nothing is left floating where Skyrim has moved on. It takes two
++		// presses, so a slip of the finger doesn't cost the player their builds. 0: switched off.
++		constexpr std::uint32_t kDikF7 = 0x41;
++		std::uint32_t           resetKey = kDikF7;
++		std::string             resetKeyName = "F7";
++		constexpr auto          kResetConfirmWindow = std::chrono::seconds(6);
++		std::chrono::steady_clock::time_point resetAskedAt{};
++
++		// The reset key was pressed: the first press asks, a second one within a few seconds does it.
++		// This only tells Minecraft (and remembers it did); the per-frame update takes the player to
++		// Skyrim's controls when Minecraft says it's on it, and back once the new world is there.
++		void AskWorldReset(bool a_skyrimMenuOpen)
++		{
++			if (a_skyrimMenuOpen) {
++				return;  // a Skyrim menu has all the input
++			}
++			auto& st = State();
++			if (st.worldReset != 0) {
++				RE::SendHUDMessage::ShowHUDMessage("SkyCraft: the world is already being reset.");
++				return;
++			}
++			if (!st.mcInWorld) {
++				RE::SendHUDMessage::ShowHUDMessage("SkyCraft: Minecraft isn't in its world yet.");
++				return;
++			}
++			const auto now = std::chrono::steady_clock::now();
++			if (resetAskedAt == std::chrono::steady_clock::time_point{} || now - resetAskedAt > kResetConfirmWindow) {
++				resetAskedAt = now;
++				const std::string note = "SkyCraft: press " + resetKeyName + " again to reset the Minecraft world. Everything built or dug is removed.";
++				RE::SendHUDMessage::ShowHUDMessage(note.c_str());
++				return;
++			}
++			resetAskedAt = {};
++			st.worldReset = 1;
++			Input::ReleaseAll();
++			Link::Get().PushInput(proto::kInResetWorld, 0);
++			logger::info("world reset: asked Minecraft to start over");
++		}
++
+ 		float lookDx = 0.0f;
+ 		float lookDy = 0.0f;
+ 
+@@ -215,6 +261,12 @@ namespace skycraft
+ 								}
+ 								break;
+ 							}
++							if (resetKey != 0 && button->GetDevice() == RE::INPUT_DEVICE::kKeyboard && button->GetIDCode() == resetKey) {
++								if (down) {
++									AskWorldReset(menuOpen);
++								}
++								break;
++							}
+ 							if (!route || (!down && !up)) {
+ 								break;
+ 							}
+@@ -345,8 +397,35 @@ namespace skycraft
+ 				toggleKey = kDikF8;
+ 				toggleKeyName = "F8";
+ 			}
++			// The reset key: "None" (or nothing) switches it off.
++			resetKeyName = ini.GetValue("Controls", "sResetKey", "F7");
++			std::string resetText;
++			for (const char c : resetKeyName) {
++				if (!std::isspace(static_cast<unsigned char>(c))) {
++					resetText.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
++				}
++			}
++			if (resetText.empty() || resetText == "none" || resetText == "off" || resetText == "0") {
++				resetKey = 0;
++			} else {
++				resetKey = ParseToggleKey(resetKeyName);
++				if (resetKey == 0 || resetKey == toggleKey) {
++					logger::warn("SkyCraft.ini [Controls] sResetKey = {}: not a key SkyCraft can use (see sToggleKey, and it can't be the same key); using F7", resetKeyName);
++					resetKey = kDikF7;
++					resetKeyName = "F7";
++				}
++				if (resetKey == toggleKey) {
++					logger::warn("sToggleKey is F7, so the world reset key is switched off; set sResetKey to another key to use it");
++					resetKey = 0;
++				}
++			}
+ 			State().skyrimMode = ini.GetBoolValue("Controls", "bStartInSkyrimMode", false);
+ 			logger::info("controls switch: {} (scan code {:#x}); starting with {}'s controls", toggleKeyName, toggleKey, State().skyrimMode ? "Skyrim" : "Minecraft");
++			if (resetKey != 0) {
++				logger::info("world reset key: {} (scan code {:#x})", resetKeyName, resetKey);
++			} else {
++				logger::info("world reset key: off");
++			}
+ 
+ 			if (auto* devices = RE::BSInputDeviceManager::GetSingleton()) {
+ 				devices->AddEventSink(InputSink::Get());
+diff --git a/tools/fake_skyrim.py b/tools/fake_skyrim.py
+index 20a05f9..ac35211 100644
+--- a/tools/fake_skyrim.py
++++ b/tools/fake_skyrim.py
+@@ -14,7 +14,7 @@ import time
+ import zlib
+ 
+ MAGIC = 0x43594B53
+-VERSION = 12
++VERSION = 13
+ NAME = os.environ.get("SKYCRAFT_LINK", "Local\\SkyCraft_v1")  # fake_guest.py runs one beside a real Skyrim
+ OFF_SKY = 0x100
+ OFF_MC = 0x200

@@ -1,0 +1,815 @@
+diff --git a/fabric/src/client/java/dev/skycraft/client/InputBridge.java b/fabric/src/client/java/dev/skycraft/client/InputBridge.java
+index 8dd80ba..073340b 100644
+--- a/fabric/src/client/java/dev/skycraft/client/InputBridge.java
++++ b/fabric/src/client/java/dev/skycraft/client/InputBridge.java
+@@ -63,6 +63,7 @@ public final class InputBridge {
+ 			}
+ 			case Proto.IN_RELEASE_ALL -> releaseAll();
+ 			case Proto.IN_HURT -> hurt(minecraft, code, a / 100.0F, b, c);
++			case Proto.IN_SKY_ATTACK -> skyAttack(minecraft, code, a / 100.0F);
+ 			case Proto.IN_RESET_WORLD -> MirrorWorld.requestReset(minecraft);
+ 			case Proto.IN_OPEN_MENU -> {
+ 				if (minecraft.gui.screen() == null && minecraft.player != null) {
+@@ -75,6 +76,21 @@ public final class InputBridge {
+ 		}
+ 	}
+ 
++	/** The player struck with their Skyrim weapon (Skyrim controls): Minecraft mobs take the hit on the integrated server. */
++	private static void skyAttack(Minecraft minecraft, int kind, float skyrimDamage) {
++		var server = minecraft.getSingleplayerServer();
++		if (server == null || minecraft.player == null) {
++			return;
++		}
++		var uuid = minecraft.player.getUUID();
++		server.execute(() -> {
++			ServerPlayer player = server.getPlayerList().getPlayer(uuid);
++			if (player != null) {
++				dev.skycraft.combat.SkyrimStrikes.strike(player, kind, skyrimDamage);
++			}
++		});
++	}
++
+ 	/** Skyrim hit the player: apply it as Minecraft damage on the integrated server (or the host's). */
+ 	private static void hurt(Minecraft minecraft, int kind, float skyrimDamage, int attacker, int flags) {
+ 		var server = minecraft.getSingleplayerServer();
+diff --git a/fabric/src/main/java/dev/skycraft/combat/MobAggro.java b/fabric/src/main/java/dev/skycraft/combat/MobAggro.java
+new file mode 100644
+index 0000000..3118418
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/combat/MobAggro.java
+@@ -0,0 +1,54 @@
++package dev.skycraft.combat;
++
++import dev.skycraft.link.SkyLink;
++import java.util.Collection;
++import java.util.HashSet;
++import java.util.Set;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.Mob;
++
++/**
++ * Hostile Minecraft mobs go for Skyrim's NPCs as hard as they would a player: any mob with no target
++ * that has an NPC (its stand-in) within reach of its senses takes the nearest one, through walls or
++ * not (SkyrimChaseGoal gets it there), and keeps at it. Done here, once for every mob near an NPC,
++ * rather than in a goal, so no other targeting goal of the mob's can talk it out of it.
++ */
++final class MobAggro {
++	private static final double RANGE = 32.0;
++
++	private MobAggro() {
++	}
++
++	static void tick(ServerLevel level, Collection<SkyrimActorEntity> actors) {
++		if (!SkyLink.active() || actors.isEmpty()) {
++			return;
++		}
++		Set<Mob> done = new HashSet<>();
++		for (SkyrimActorEntity npc : actors) {
++			if (!npc.isAlive()) {
++				continue;
++			}
++			for (Mob mob : level.getEntitiesOfClass(Mob.class, npc.getBoundingBox().inflate(RANGE, 10.0, RANGE), AttackSkyrimActorsGoal::wants)) {
++				if (!mob.isAlive() || mob.isPassenger() || !done.add(mob)) {
++					continue;
++				}
++				var target = mob.getTarget();
++				if (target != null && target.isAlive()) {
++					continue;
++				}
++				SkyrimActorEntity nearest = null;
++				double best = RANGE * RANGE;
++				for (SkyrimActorEntity other : actors) {
++					double d = other.isAlive() && Math.abs(other.getY() - mob.getY()) < 10.0 ? mob.distanceToSqr(other) : Double.MAX_VALUE;
++					if (d < best) {
++						best = d;
++						nearest = other;
++					}
++				}
++				if (nearest != null) {
++					mob.setTarget(nearest);
++				}
++			}
++		}
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/combat/NpcFightsBack.java b/fabric/src/main/java/dev/skycraft/combat/NpcFightsBack.java
+index 1a6627e..3099a01 100644
+--- a/fabric/src/main/java/dev/skycraft/combat/NpcFightsBack.java
++++ b/fabric/src/main/java/dev/skycraft/combat/NpcFightsBack.java
+@@ -4,66 +4,126 @@ import dev.skycraft.link.Proto;
+ import dev.skycraft.link.SkyLink;
+ import java.util.Collection;
+ import java.util.HashMap;
++import java.util.Iterator;
+ import java.util.Map;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.world.entity.Mob;
+ import net.minecraft.world.entity.MobCategory;
+ 
+ /**
+- * Skyrim's NPCs fight the Minecraft mobs that go for them. Skyrim's own AI has no idea a zombie
+- * exists, so it would stand there and take it; this makes a fighter (anyone with a fighting streak,
+- * not a shopkeeper) turn on the mob once it is in reach and hit it with the NPC's stand-in's blows,
+- * through Minecraft's own damage ({@code mobAttack}: armour, knockback, the mob hitting back at the NPC
+- * in turn). Skyrim is told to turn the NPC to face the mob and play its attack swing
+- * ({@link Proto#EV_NPC_SWING}), so it looks like the NPC's own blow.
++ * Skyrim's NPCs fight the Minecraft mobs that go for them, the way they fight a vanilla Skyrim enemy:
++ * a fighter (anyone with a fighting streak, not a shopkeeper) that notices a hostile mob draws its
++ * weapon, faces it, swings at it whenever it is in reach, and puts the weapon away once the fight has
++ * been over for a few seconds. Skyrim's own AI has no idea a zombie exists, so this drives the NPC's
++ * draw, turn and swing animations ({@link Proto#EV_NPC_SWING}, d = mode); the damage is Minecraft's
++ * ({@code mobAttack}: armour, knockback, the mob hitting back in turn).
+  *
+- * <p>It only answers: a mob that's after the NPC, or a hostile one that has come close. The NPC
+- * doesn't leave its place to chase one. Turn it off with the JVM argument {@code -Dskycraft.npcsFightBack=false}.
++ * <p>The NPC doesn't leave its place to chase one. Turn it off with {@code -Dskycraft.npcsFightBack=false}.
+  */
+ final class NpcFightsBack {
+ 	private static final boolean ENABLED = !"false".equalsIgnoreCase(System.getProperty("skycraft.npcsFightBack"));
+ 	/** How far past its own body an NPC's blow reaches, in blocks. */
+ 	private static final double REACH = 2.2;
++	/** How far away a hostile mob makes an NPC reach for its weapon. */
++	private static final double ALERT = 18.0;
+ 	/** Anyone shorter than this (children, small creatures) keeps out of it. */
+ 	private static final float MIN_HEIGHT = 1.2F;
+-	private static final Map<Integer, Long> READY_AT = new HashMap<>();
++	/** Ticks a weapon takes to come out before the first swing. */
++	private static final int DRAW_TICKS = 30;
++	/** Ticks without a mob in sight before the weapon goes away. */
++	private static final int STAND_DOWN_TICKS = 80;
++
++	private static final int MODE_SWING = 0, MODE_DRAW = 1, MODE_SHEATHE = 2;
++
++	/** An archer shoots from this far. */
++	private static final double BOW_RANGE = 18.0;
++	/** Ticks from the swing starting to it landing (melee) and from the string being drawn to the arrow arriving (bow). */
++	private static final int MELEE_DELAY = 8, BOW_DELAY = 24;
++	/** If Skyrim keeps putting the weapon away, the NPC fights anyway after this long. */
++	private static final int STUCK_TICKS = 100;
++
++	private static final class Fight {
++		long drawnAt, lastMob, readyAt, lastDraw, landAt;
++		Mob victim;
++		float damage;
++	}
++
++	private static final Map<Integer, Fight> FIGHTS = new HashMap<>();
+ 
+ 	private NpcFightsBack() {
+ 	}
+ 
++	private static void send(int formId, int mode, double x, double y, double z) {
++		SkyLink.pushEvent(Proto.EV_NPC_SWING, formId, (float) x, (float) y, (float) z, (float) mode, 0);
++	}
++
+ 	static void tick(ServerLevel level, Collection<SkyrimActorEntity> actors) {
+ 		if (!ENABLED || !SkyLink.active()) {
++			FIGHTS.clear();
+ 			return;
+ 		}
+ 		long now = level.getGameTime();
+-		READY_AT.values().removeIf(at -> at < now - 200);
++		for (Iterator<Map.Entry<Integer, Fight>> it = FIGHTS.entrySet().iterator(); it.hasNext(); ) {
++			Map.Entry<Integer, Fight> e = it.next();
++			SkyrimActorEntity npc = SkyCombat.proxy(e.getKey());
++			if (npc == null || !npc.isAlive() || npc.inSkyrimCombat()) {
++				it.remove(); // gone, dead, or Skyrim has taken the fight over
++			} else if (now - e.getValue().lastMob > STAND_DOWN_TICKS) {
++				send(e.getKey(), MODE_SHEATHE, 0, 0, 0);
++				it.remove();
++			}
++		}
+ 		for (SkyrimActorEntity npc : actors) {
+ 			if (!npc.isAlive() || !npc.fighter() || npc.inSkyrimCombat() || npc.getBbHeight() < MIN_HEIGHT) {
+ 				continue;
+ 			}
+-			Long ready = READY_AT.get(npc.formId());
+-			if (ready != null && now < ready) {
+-				continue;
+-			}
+ 			Mob best = null;
+ 			double bestGap = Double.MAX_VALUE;
+-			for (Mob mob : level.getEntitiesOfClass(Mob.class, npc.getBoundingBox().inflate(REACH + 1.5, 1.5, REACH + 1.5))) {
++			for (Mob mob : level.getEntitiesOfClass(Mob.class, npc.getBoundingBox().inflate(ALERT, 3.0, ALERT))) {
+ 				if (!mob.isAlive() || !(mob.getType().getCategory() == MobCategory.MONSTER || mob.getTarget() == npc)) {
+ 					continue;
+ 				}
+ 				double gap = Math.hypot(mob.getX() - npc.getX(), mob.getZ() - npc.getZ()) - npc.getBbWidth() * 0.5 - mob.getBbWidth() * 0.5;
+-				if (gap < REACH && gap < bestGap && Math.abs(mob.getY() - npc.getY()) < npc.getBbHeight() && SkyrimMobs.canSee(npc, mob)) {
++				if (gap < ALERT && gap < bestGap && Math.abs(mob.getY() - npc.getY()) < npc.getBbHeight() + 1.0 && SkyrimMobs.canSee(npc, mob)) {
+ 					best = mob;
+ 					bestGap = gap;
+ 				}
+ 			}
++			Fight fight = FIGHTS.get(npc.formId());
++			if (fight != null && fight.victim != null && now >= fight.landAt) {
++				if (fight.victim.isAlive()) {
++					fight.victim.hurtServer(level, level.damageSources().mobAttack(npc), fight.damage);
++				}
++				fight.victim = null;
++			}
+ 			if (best == null) {
+ 				continue;
+ 			}
+-			float damage = 3.0F + npc.getRandom().nextFloat() * 3.0F;
+-			best.hurtServer(level, level.damageSources().mobAttack(npc), damage);
+-			SkyLink.pushEvent(Proto.EV_NPC_SWING, npc.formId(), (float) best.getX(), (float) best.getY(), (float) best.getZ(), 0.0F, 0);
+-			READY_AT.put(npc.formId(), now + 20 + npc.getRandom().nextInt(16));
++			if (fight == null) {
++				fight = new Fight();
++				fight.drawnAt = now;
++				FIGHTS.put(npc.formId(), fight);
++				fight.lastDraw = now;
++				send(npc.formId(), MODE_DRAW, best.getX(), best.getY(), best.getZ());
++			}
++			fight.lastMob = now;
++			if (now - fight.lastDraw >= 8) {
++				fight.lastDraw = now;
++				send(npc.formId(), MODE_DRAW, best.getX(), best.getY(), best.getZ()); // keep facing it; Skyrim draws only if the weapon is away
++			}
++			boolean bow = npc.bow();
++			double reach = bow ? BOW_RANGE : REACH;
++			boolean ready = npc.weaponDrawn() || now > fight.drawnAt + STUCK_TICKS;
++			if (!ready || fight.victim != null || now < fight.drawnAt + DRAW_TICKS || now < fight.readyAt || bestGap >= reach
++				|| Math.abs(best.getY() - npc.getY()) >= (bow ? 6.0 : npc.getBbHeight())) {
++				continue;
++			}
++			// Swing (or draw the string) now; the blow lands when the animation gets there.
++			send(npc.formId(), MODE_SWING, best.getX(), best.getY(), best.getZ());
++			fight.victim = best;
++			fight.damage = bow ? 5.0F + npc.getRandom().nextFloat() * 4.0F : 4.0F + npc.getRandom().nextFloat() * 3.0F;
++			fight.landAt = now + (bow ? BOW_DELAY : MELEE_DELAY);
++			fight.readyAt = now + (bow ? 50 : 20) + npc.getRandom().nextInt(12);
+ 		}
+ 	}
+ }
+diff --git a/fabric/src/main/java/dev/skycraft/combat/SkyCombat.java b/fabric/src/main/java/dev/skycraft/combat/SkyCombat.java
+index 6a89afe..8c0583d 100644
+--- a/fabric/src/main/java/dev/skycraft/combat/SkyCombat.java
++++ b/fabric/src/main/java/dev/skycraft/combat/SkyCombat.java
+@@ -96,6 +96,9 @@ public final class SkyCombat {
+ 		if (level.getGameTime() % 4 == 0) {
+ 			NpcFightsBack.tick(level, PROXIES.values());
+ 		}
++		if (level.getGameTime() % 10 == 0) {
++			MobAggro.tick(level, PROXIES.values());
++		}
+ 	}
+ 
+ 	private static void sync(ServerLevel level) {
+diff --git a/fabric/src/main/java/dev/skycraft/combat/SkyrimActorEntity.java b/fabric/src/main/java/dev/skycraft/combat/SkyrimActorEntity.java
+index a8fdc32..f1a7b30 100644
+--- a/fabric/src/main/java/dev/skycraft/combat/SkyrimActorEntity.java
++++ b/fabric/src/main/java/dev/skycraft/combat/SkyrimActorEntity.java
+@@ -45,6 +45,37 @@ public class SkyrimActorEntity extends LivingEntity {
+ 	// The actor's Proto.ACTOR_* flags from Skyrim's last update (server side only).
+ 	private int skyFlags;
+ 
++	// Entity.invulnerableTime is private in this Minecraft; it isn't obfuscated, so reach it by name.
++	private static final java.lang.reflect.Field IMMUNITY = findImmunity();
++
++	private static java.lang.reflect.Field findImmunity() {
++		for (Class<?> c = SkyrimActorEntity.class; c != null; c = c.getSuperclass()) {
++			try {
++				java.lang.reflect.Field f = c.getDeclaredField("invulnerableTime");
++				f.setAccessible(true);
++				return f;
++			} catch (ReflectiveOperationException | RuntimeException e) {
++				// try the parent class
++			}
++		}
++		dev.skycraft.SkyCraft.LOG.warn("SkyCraft: can't reach Entity.invulnerableTime; Skyrim NPCs may shrug off repeated hits");
++		return null;
++	}
++
++	private static void tickImmunity(Entity entity) {
++		if (IMMUNITY == null) {
++			return;
++		}
++		try {
++			int left = IMMUNITY.getInt(entity);
++			if (left > 0) {
++				IMMUNITY.setInt(entity, left - 1);
++			}
++		} catch (ReflectiveOperationException | RuntimeException e) {
++			// leave it
++		}
++	}
++
+ 	public SkyrimActorEntity(EntityType<? extends SkyrimActorEntity> type, Level level) {
+ 		super(type, level);
+ 		this.setNoGravity(true);
+@@ -62,6 +93,16 @@ public class SkyrimActorEntity extends LivingEntity {
+ 		return (this.skyFlags & Proto.ACTOR_FIGHTER) != 0;
+ 	}
+ 
++	/** Holds a bow or crossbow. */
++	public boolean bow() {
++		return (this.skyFlags & Proto.ACTOR_BOW) != 0;
++	}
++
++	/** Its weapon is out of its sheath. */
++	public boolean weaponDrawn() {
++		return (this.skyFlags & Proto.ACTOR_WEAPON_DRAWN) != 0;
++	}
++
+ 	/** Already in a fight Skyrim runs itself. */
+ 	public boolean inSkyrimCombat() {
+ 		return (this.skyFlags & Proto.ACTOR_IN_COMBAT) != 0;
+@@ -104,6 +145,18 @@ public class SkyrimActorEntity extends LivingEntity {
+ 		return EntityDimensions.scalable(this.entityData.get(WIDTH), this.entityData.get(HEIGHT));
+ 	}
+ 
++	private static int mobHurtLogs;
++
++	@Override
++	public boolean hurtServer(ServerLevel level, DamageSource source, float damage) {
++		boolean hurt = super.hurtServer(level, source, damage);
++		if (source.getEntity() instanceof Mob attacker && mobHurtLogs++ < 60) {
++			dev.skycraft.SkyCraft.LOG.info("SkyCraft: {} ({}) attacked Skyrim actor {} for {}: {}", attacker.getName().getString(), source.type().msgId(),
++				String.format("%08X", this.formId()), damage, hurt ? "landed" : "refused");
++		}
++		return hurt;
++	}
++
+ 	@Override
+ 	protected void actuallyHurt(ServerLevel level, DamageSource source, float dmg) {
+ 		// Minecraft has applied everything (crit, sharpness, strength, cooldown, invulnerability
+@@ -195,6 +248,12 @@ public class SkyrimActorEntity extends LivingEntity {
+ 	public void tick() {
+ 		// Position and rotation come from Skyrim (SkyCombat); keep hurt timers and fire ticking.
+ 		this.baseTick();
++		// aiStep never runs for a stand-in, and that is what counts the post-hit immunity and hurt
++		// timers down: without this the first hit lands and every later one (a mob's, an arrow) bounces off.
++		tickImmunity(this);
++		if (this.hurtTime > 0) {
++			this.hurtTime--;
++		}
+ 		this.setHealth(this.getMaxHealth());
+ 	}
+ 
+diff --git a/fabric/src/main/java/dev/skycraft/combat/SkyrimSpawner.java b/fabric/src/main/java/dev/skycraft/combat/SkyrimSpawner.java
+index f440d82..823f21a 100644
+--- a/fabric/src/main/java/dev/skycraft/combat/SkyrimSpawner.java
++++ b/fabric/src/main/java/dev/skycraft/combat/SkyrimSpawner.java
+@@ -52,7 +52,7 @@ public final class SkyrimSpawner {
+ 	private static final String TAG = "skycraft_natural";
+ 
+ 	private static final int MONSTER_EVERY = 20;
+-	private static final int ANIMAL_EVERY = 100;
++	private static final int ANIMAL_EVERY = 60;
+ 	private static final int UPKEEP_EVERY = 10;
+ 	private static final double MIN_DISTANCE = 24.0;
+ 	private static final double ANIMAL_MIN_DISTANCE = 16.0;
+@@ -90,6 +90,16 @@ public final class SkyrimSpawner {
+ 	// Monsters standing under Skyrim's roofs: Minecraft would burn them in daylight, there being no blocks over them.
+ 	private static final List<Mob> SHADED = new ArrayList<>();
+ 
++	// Why spots were turned down, and how many mobs went in, reported to the log every half minute.
++	private static final Map<String, Integer> REJECTS = new HashMap<>();
++	private static int spawned, attempts;
++	private static boolean waitingLogged;
++
++	private static double[] reject(String why) {
++		REJECTS.merge(why, 1, Integer::sum);
++		return null;
++	}
++
+ 	private SkyrimSpawner() {
+ 	}
+ 
+@@ -107,9 +117,18 @@ public final class SkyrimSpawner {
+ 			}
+ 		}
+ 		if (!SkyLink.active() || !SkyTime.known()) {
++			if (SkyLink.active() && !waitingLogged && server.getTickCount() % 200 == 0) {
++				waitingLogged = true;
++				dev.skycraft.SkyCraft.LOG.info("SkyCraft spawner: waiting for Skyrim's clock (SkyTime isn't live yet)");
++			}
+ 			return;
+ 		}
+ 		int ticks = server.getTickCount();
++		if (ticks % 600 == 0) {
++			dev.skycraft.SkyCraft.LOG.info("SkyCraft spawner: hour {}, {} attempts, {} mobs spawned, turned-down spots: {}", SkyTime.hour(), attempts, spawned, REJECTS);
++			REJECTS.clear();
++			attempts = 0;
++		}
+ 		boolean upkeep = ticks % UPKEEP_EVERY == 0;
+ 		if (upkeep) {
+ 			SHADED.clear();
+@@ -165,7 +184,8 @@ public final class SkyrimSpawner {
+ 		if (type == null) {
+ 			return;
+ 		}
+-		for (int tries = 0; tries < 6; tries++) {
++		attempts++;
++		for (int tries = 0; tries < 10; tries++) {
+ 			double angle = random.nextDouble() * (Math.PI * 2.0);
+ 			double distance = (monsters ? MIN_DISTANCE : ANIMAL_MIN_DISTANCE) + random.nextDouble() * (MAX_DISTANCE - (monsters ? MIN_DISTANCE : ANIMAL_MIN_DISTANCE));
+ 			double[] spot = findSpot(level, player, player.getX() + Math.cos(angle) * distance, player.getZ() + Math.sin(angle) * distance, type.getHeight(), monsters);
+@@ -185,15 +205,28 @@ public final class SkyrimSpawner {
+ 					continue;
+ 				}
+ 				mob.snapTo(at[0], at[1], at[2], random.nextFloat() * 360.0F, 0.0F);
+-				if (!level.noCollision(mob)) {
++				// Standing exactly on Skyrim's surface can clip its voxelised collision; start a little
++				// higher if so and let the mob drop onto the ground.
++				boolean room = level.noCollision(mob);
++				for (double lift : new double[] { 0.15, 0.35, 0.7 }) {
++					if (room) {
++						break;
++					}
++					mob.snapTo(at[0], at[1] + lift, at[2], mob.getYRot(), 0.0F);
++					room = level.noCollision(mob);
++				}
++				if (!room) {
++					REJECTS.merge("no room for the mob", 1, Integer::sum);
+ 					mob.discard();
+ 					continue;
+ 				}
+ 				mob.addTag(TAG);
++				mob.setPersistenceRequired(); // Minecraft's own despawning would thin them out; upkeep() handles distance
+ 				group = mob.finalizeSpawn(level, level.getCurrentDifficultyAt(mob.blockPosition()), EntitySpawnReason.NATURAL, group);
+ 				level.addFreshEntityWithPassengers(mob);
+ 				if (!mob.isRemoved()) {
+ 					placed++;
++					spawned++;
+ 				}
+ 			}
+ 			if (placed > 0) {
+@@ -221,36 +254,39 @@ public final class SkyrimSpawner {
+ 	private static double[] findSpot(ServerLevel level, ServerPlayer player, double x, double z, float height, boolean monster) {
+ 		int bx = (int) Math.floor(x), bz = (int) Math.floor(z);
+ 		if (!SkyCollision.isKnown(bx, (int) Math.floor(player.getY()), bz)) {
+-			return null;
++			return reject("geometry not sent there");
+ 		}
+ 		double top = player.getY() + ABOVE, bottom = player.getY() - BELOW;
+ 		List<SkyTri> tris = new ArrayList<>();
+ 		SkyCollision.trianglesNear(new AABB(x - 1.0, bottom, z - 1.0, x + 1.0, top, z + 1.0), tris);
+ 		SkyRay.Hit ground = tris.isEmpty() ? null : SkyRay.cast(tris, x, top, z, x, bottom, z);
+-		if (ground == null || ground.ny() < SkyTri.WALKABLE_NY || !ground.tri().walkable) {
+-			return null;
++		if (ground == null) {
++			return reject("no ground found");
++		}
++		if (ground.ny() < SkyTri.WALKABLE_NY || !ground.tri().walkable) {
++			return reject("too steep / roof above");
+ 		}
+ 		double y = ground.y();
+ 		double surface = SkyWater.surfaceAt(bx, bz);
+ 		if (!Double.isNaN(surface) && surface > y - 0.2) {
+-			return null; // water
++			return reject("water");
+ 		}
+ 		boolean covered = SkyrimMobs.covered(x, y, z, height);
+ 		if (monster ? !(SkyTime.isNight() || covered) : (covered || !SkyTime.isDay() || !ground.tri().terrain)) {
+-			return null; // monsters want the dark, animals open land in daylight
++			return reject(monster ? "monster: open ground by day" : "animal: night / covered / not terrain");
+ 		}
+ 		// Room for the mob, and a spot the player could walk or look to, not the far side of a wall or the top of a roof.
+ 		List<SkyTri> room = new ArrayList<>();
+ 		SkyCollision.trianglesNear(new AABB(x - 0.4, y + 0.1, z - 0.4, x + 0.4, y + height, z + 0.4), room);
+ 		if (!room.isEmpty() && SkyRay.cast(room, x, y + 0.1, z, x, y + height, z) != null) {
+-			return null;
++			return reject("blocked headroom");
+ 		}
+-		if (!SkyrimMobs.canSee(player, x, y + height * 0.85, z)) {
+-			return null;
++		if (!SkyrimMobs.canSee(player, x, y + height, z)) {
++			return reject("out of player's sight");
+ 		}
+ 		AABB nearNpcs = new AABB(x - NPC_BUFFER, y - 8.0, z - NPC_BUFFER, x + NPC_BUFFER, y + 8.0, z + NPC_BUFFER);
+ 		if (!level.getEntitiesOfClass(SkyrimActorEntity.class, nearNpcs, npc -> npc.isAlive()).isEmpty()) {
+-			return null;
++			return reject("near NPCs");
+ 		}
+ 		return new double[] { x, y, z };
+ 	}
+diff --git a/fabric/src/main/java/dev/skycraft/combat/SkyrimStrikes.java b/fabric/src/main/java/dev/skycraft/combat/SkyrimStrikes.java
+new file mode 100644
+index 0000000..17ae8f1
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/combat/SkyrimStrikes.java
+@@ -0,0 +1,62 @@
++package dev.skycraft.combat;
++
++import dev.skycraft.link.SkyLink;
++import java.util.List;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.phys.AABB;
++import net.minecraft.world.phys.Vec3;
++
++/**
++ * The player's own Skyrim weapon against Minecraft mobs (Skyrim controls). Skyrim's blade and arrows
++ * pass through a mob, which Skyrim knows nothing about, so Skyrim reports each swing or release with the
++ * weapon's damage and this finds the mob in the way along the player's look and hurts it as the player.
++ */
++public final class SkyrimStrikes {
++	/** Skyrim weapon damage to Minecraft damage (an iron sword's 7 is about a stone sword's 5). */
++	private static final float SKYRIM_TO_MC = 0.75F;
++	private static final double MELEE_REACH = 3.0;
++	private static final double ARROW_RANGE = 48.0;
++
++	private SkyrimStrikes() {
++	}
++
++	/** {@code kind}: 0 melee, 1 arrow. Runs on the server thread. */
++	public static void strike(ServerPlayer player, int kind, float skyrimDamage) {
++		if (!player.isAlive() || !SkyLink.active() || !(player.level() instanceof ServerLevel level)) {
++			return;
++		}
++		Vec3 eye = player.getEyePosition();
++		Vec3 look = player.getLookAngle();
++		double reach = kind == 1 ? ARROW_RANGE : MELEE_REACH;
++		Vec3 end = eye.add(look.scale(reach));
++		List<Mob> mobs = level.getEntitiesOfClass(Mob.class, new AABB(eye, end).inflate(1.5), Mob::isAlive);
++		Mob best = null;
++		double bestDist = Double.MAX_VALUE;
++		for (Mob mob : mobs) {
++			double d;
++			if (kind == 1) {
++				var hit = mob.getBoundingBox().inflate(0.3).clip(eye, end);
++				if (hit.isEmpty()) {
++					continue;
++				}
++				d = eye.distanceTo(hit.get());
++			} else {
++				Vec3 to = mob.getBoundingBox().getCenter().subtract(eye);
++				double dist = to.length() - mob.getBbWidth() * 0.5;
++				if (dist > reach || to.normalize().dot(look) < 0.55) {
++					continue;
++				}
++				d = dist;
++			}
++			if (d < bestDist && SkyrimMobs.canSee(player, mob)) {
++				best = mob;
++				bestDist = d;
++			}
++		}
++		if (best != null) {
++			best.hurtServer(level, level.damageSources().playerAttack(player), Math.max(1.0F, skyrimDamage * SKYRIM_TO_MC));
++		}
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/link/Proto.java b/fabric/src/main/java/dev/skycraft/link/Proto.java
+index 777ca8a..9a598df 100644
+--- a/fabric/src/main/java/dev/skycraft/link/Proto.java
++++ b/fabric/src/main/java/dev/skycraft/link/Proto.java
+@@ -41,6 +41,7 @@ public final class Proto {
+ 	public static final int IN_HURT = 7;
+ 	public static final int IN_OPEN_MENU = 8;
+ 	public static final int IN_RESET_WORLD = 9;
++	public static final int IN_SKY_ATTACK = 10;
+ 	public static final int HURT_MELEE = 0;
+ 	public static final int HURT_PROJECTILE = 1;
+ 	public static final int HURT_MAGIC = 2;
+@@ -59,6 +60,8 @@ public final class Proto {
+ 	public static final int ACTOR_ESSENTIAL = 1 << 2;
+ 	public static final int ACTOR_IN_COMBAT = 1 << 3;
+ 	public static final int ACTOR_FIGHTER = 1 << 4;
++	public static final int ACTOR_BOW = 1 << 5;
++	public static final int ACTOR_WEAPON_DRAWN = 1 << 6;
+ 
+ 	// Event ring (relative to OFF_EVENT_RING)
+ 	public static final int EVENT_RING_ENTRIES = 512;
+diff --git a/protocol/skycraft_protocol.h b/protocol/skycraft_protocol.h
+index e0a9b36..79c276c 100644
+--- a/protocol/skycraft_protocol.h
++++ b/protocol/skycraft_protocol.h
+@@ -185,6 +185,7 @@ namespace skycraft::proto
+ 		kInHurt = 7,         // Skyrim hit the player: code = HurtKind, a = Skyrim damage * 100, b = attacker FormID, c = HurtFlags
+ 		kInOpenMenu = 8,     // open Minecraft's pause/options menu
+ 		kInResetWorld = 9,   // throw Minecraft's world away (every block built or dug) and load a fresh one
++		kInSkyAttack = 10,   // the player struck with their own Skyrim weapon (Skyrim controls): code = 0 melee / 1 arrow, a = Skyrim damage * 100
+ 	};
+ 
+ 	enum HurtKind : std::uint16_t
+@@ -212,6 +213,8 @@ namespace skycraft::proto
+ 		kActorEssential = 1u << 2,
+ 		kActorInCombat = 1u << 3,
+ 		kActorFighter = 1u << 4,    // has a fighting streak (Aggression above 0), not a civilian who flees
++		kActorBow = 1u << 5,        // holds a bow or crossbow
++		kActorWeaponDrawn = 1u << 6,  // its weapon is out
+ 	};
+ 
+ 	struct ActorRecord
+@@ -254,7 +257,8 @@ namespace skycraft::proto
+ 		kEvSkillUse = 5,    // the player used a Skyrim skill in Minecraft: formId = Skyrim skill (ActorValue: 9 Block,
+ 		                    // 10 Smithing, 11 Heavy Armor, 12 Light Armor), a = uses (as Skyrim's AdvanceSkill counts them)
+ 		kEvNpcSwing = 6,    // a Skyrim NPC swings at a Minecraft mob: formId = the NPC, a/b/c = the mob's position (MC coords).
+-		                    // Skyrim turns the NPC to face it and plays its attack; the damage is Minecraft's
++		                    // Skyrim turns the NPC to face it and plays its attack; the damage is Minecraft's.
++		                    // d = mode: 0 swing, 1 draw the weapon (if sheathed) and face the mob, 2 put the weapon away
+ 	};
+ 
+ 	enum HitFlags : std::uint32_t
+diff --git a/skse/src/Combat.cpp b/skse/src/Combat.cpp
+index 152ee76..f3a5dc8 100644
+--- a/skse/src/Combat.cpp
++++ b/skse/src/Combat.cpp
+@@ -193,6 +193,17 @@ namespace skycraft
+ 				r.flags = (actor->IsHostileToActor(a_player) ? proto::kActorHostile : 0u) | (actor->IsDead() ? proto::kActorDead : 0u) |
+ 				          (actor->IsEssential() ? proto::kActorEssential : 0u) | (actor->IsInCombat() ? proto::kActorInCombat : 0u) |
+ 			          (actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kAggression) >= 1.0f ? proto::kActorFighter : 0u);
++				if (auto* state = actor->AsActorState(); state && state->GetWeaponState() == RE::WEAPON_STATE::kDrawn) {
++					r.flags |= proto::kActorWeaponDrawn;
++				}
++				if (auto* held = actor->GetEquippedObject(false)) {
++					if (auto* weapon = held->As<RE::TESObjectWEAP>()) {
++						const auto type = weapon->GetWeaponType();
++						if (type == RE::WEAPON_TYPE::kBow || type == RE::WEAPON_TYPE::kCrossbow) {
++							r.flags |= proto::kActorBow;
++						}
++					}
++				}
+ 				const auto mc = SkyToMc(pos);
+ 				r.x = static_cast<float>(mc.x);
+ 				r.y = static_cast<float>(mc.y);
+@@ -325,10 +336,32 @@ namespace skycraft
+ 		// of the player's, but nobody in Skyrim is the attacker. The player didn't do it, so no bounty, no
+ 		// combat with the player and no skill experience; the actor just takes the damage, staggers if it
+ 		// was a big one, and bleeds where it was hit.
++		// Takes health straight off the actor value (DoDamage with no attacker does nothing on some
++		// builds). An essential actor is left at 1 health; anyone else whose health runs out is killed.
++		void DamageActor(RE::Actor* a_actor, float a_damage)
++		{
++			if (a_damage <= 0.0f || a_actor->IsDead()) {
++				return;
++			}
++			auto*       values = a_actor->AsActorValueOwner();
++			const float health = values->GetActorValue(RE::ActorValue::kHealth);
++			if (a_actor->IsEssential() && a_damage >= health) {
++				a_damage = std::max(0.0f, health - 1.0f);
++			}
++			values->RestoreActorValue(RE::ActorValue::kHealth, -a_damage);  // this CommonLib takes (value, amount); a negative amount is damage
++			if (values->GetActorValue(RE::ActorValue::kHealth) >= health - 0.01f) {
++				a_actor->DoDamage(a_damage, nullptr, true);  // that didn't take: the engine's own damage call
++			}
++			logger::info("damage to {}: health {:.0f} -> {:.0f}", a_actor->GetDisplayFullName(), health, values->GetActorValue(RE::ActorValue::kHealth));
++			if (values->GetActorValue(RE::ActorValue::kHealth) <= 0.0f && !a_actor->IsDead() && !a_actor->IsEssential()) {
++				a_actor->KillImpl(nullptr, a_damage, true, false);
++			}
++		}
++
+ 		void ApplyMobHit(RE::Actor* a_actor, const proto::McEvent& a_ev, float a_damage, float a_stagger)
+ 		{
+ 			if (a_damage > 0.0f) {
+-				a_actor->DoDamage(a_damage, nullptr, true);
++				DamageActor(a_actor, a_damage);
+ 			}
+ 			if (a_stagger > 0.0f && !a_actor->IsDead()) {
+ 				const float pushHeading = std::atan2(a_ev.b, -a_ev.c);  // MC (x, z) -> Skyrim heading
+@@ -432,12 +465,30 @@ namespace skycraft
+ 
+ 		// A Skyrim NPC fights back at a Minecraft mob. Skyrim's AI doesn't know the mob exists, so the NPC is
+ 		// turned to face it and plays its attack swing here; the damage the mob takes is Minecraft's.
++		struct BowRelease
++		{
++			std::uint32_t formId;
++			float         delay;
++		};
++		std::vector<BowRelease> bowReleases;
++
+ 		void NpcSwing(const proto::McEvent& a_ev)
+ 		{
+ 			auto* actor = RE::TESForm::LookupByID<RE::Actor>(a_ev.formId);
+ 			if (!actor || actor->IsDead() || actor->IsInCombat() || !actor->Is3DLoaded()) {
+ 				return;  // a fight Skyrim runs itself is left to it
+ 			}
++			const int  mode = static_cast<int>(a_ev.d);  // 0 swing, 1 engage (face it, draw if away), 2 put the weapon away
++			const auto weaponState = actor->AsActorState()->GetWeaponState();
++			const bool drawn = weaponState == RE::WEAPON_STATE::kDrawn;
++			const bool busy = weaponState == RE::WEAPON_STATE::kDrawing || weaponState == RE::WEAPON_STATE::kWantToDraw;
++			if (mode == 2) {
++				// Fight over: holster once, the way an NPC does after killing a Skyrim enemy.
++				if (drawn || busy) {
++					actor->DrawWeaponMagicHands(false);
++				}
++				return;
++			}
+ 			const auto target = McToSky(a_ev.a, a_ev.b, a_ev.c);
+ 			const auto pos = actor->GetPosition();
+ 			const float heading = std::atan2(target.x - pos.x, target.y - pos.y);  // Skyrim heading: 0 is north (+Y), clockwise
+@@ -450,8 +501,67 @@ namespace skycraft
+ 				}
+ 			};
+ 			face(actor, heading);
+-			actor->DrawWeaponMagicHands(true);
+-			actor->NotifyAnimationGraph("attackStart");
++			if (!drawn) {
++				// Weapon out first, and only then swing: asking for a swing while it is still being drawn
++				// is what made the draw itself look like the attack.
++				if (!busy) {
++					actor->DrawWeaponMagicHands(true);
++				}
++				return;
++			}
++			if (mode == 0) {
++				actor->NotifyAnimationGraph("attackStart");
++				bool bow = false;
++				if (auto* held = actor->GetEquippedObject(false)) {
++					if (auto* weapon = held->As<RE::TESObjectWEAP>()) {
++						bow = weapon->GetWeaponType() == RE::WEAPON_TYPE::kBow || weapon->GetWeaponType() == RE::WEAPON_TYPE::kCrossbow;
++					}
++				}
++				if (bow) {
++					bowReleases.push_back({ a_ev.formId, 0.85f });  // draws the string, then looses the arrow
++				}
++			}
++		}
++
++		void UpdateNpcBows(float a_delta)
++		{
++			for (auto it = bowReleases.begin(); it != bowReleases.end();) {
++				it->delay -= a_delta;
++				if (it->delay <= 0.0f) {
++					if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(it->formId); actor && !actor->IsDead()) {
++						actor->NotifyAnimationGraph("attackRelease");
++					}
++					it = bowReleases.erase(it);
++				} else {
++					++it;
++				}
++			}
++		}
++
++		// Skyrim controls: the player swings or looses an arrow with their own weapon. Skyrim's weapon
++		// can't touch a Minecraft mob, so the moment of the strike is sent over with the weapon's damage
++		// and Minecraft finds what stood in the way.
++		RE::ATTACK_STATE_ENUM prevAttack = RE::ATTACK_STATE_ENUM::kNone;
++
++		void PollPlayerStrike(RE::PlayerCharacter* a_player)
++		{
++			const auto state = a_player->AsActorState()->GetAttackState();
++			if (state == prevAttack) {
++				return;
++			}
++			prevAttack = state;
++			const bool melee = state == RE::ATTACK_STATE_ENUM::kSwing;
++			const bool bow = state == RE::ATTACK_STATE_ENUM::kBowReleased;
++			if (!melee && !bow) {
++				return;
++			}
++			float damage = 4.0f;  // bare fists
++			if (auto* held = a_player->GetEquippedObject(false)) {
++				if (auto* weapon = held->As<RE::TESObjectWEAP>()) {
++					damage = static_cast<float>(weapon->GetAttackDamage()) + (bow ? 8.0f : 0.0f);
++				}
++			}
++			Link::Get().PushInput(proto::kInSkyAttack, bow ? 1 : 0, static_cast<std::int32_t>(damage * 100.0f), 0, 0);
+ 		}
+ 
+ 		void KillPlayer(RE::PlayerCharacter* a_player, const proto::McEvent& a_ev)
+@@ -911,18 +1021,37 @@ namespace skycraft
+ 				}
+ 				healthPrimed = false;
+ 				engaged = false;
+-				// Still drain Minecraft's events so stale hits don't land when control resumes.
+-				// (In Skyrim's own control mode Minecraft's player is only riding along, so whatever
+-				// happens to it isn't the Skyrim player's death.)
++				if (State().skyrimMode && link.McAlive() && !a_player->IsDead()) {
++					PollPlayerStrike(a_player);
++				} else {
++					prevAttack = RE::ATTACK_STATE_ENUM::kNone;
++				}
++				// In Skyrim's own control mode Minecraft's world still runs around the rider: its mobs
++				// fight Skyrim's NPCs, so the actor table keeps being written and mob/NPC events handled.
++				const bool riding = State().skyrimMode && link.McAlive() && !a_player->IsDead();
++				if (riding) {
++					WriteActorTable(a_player);
++				}
+ 				proto::McEvent ev;
+ 				while (link.PopEvent(ev)) {
+ 					if (ev.type == proto::kEvPlayerDied && link.McAlive() && !State().skyrimMode) {
+ 						KillPlayer(a_player, ev);
++					} else if (riding) {
++						if (ev.type == proto::kEvHitActor) {
++							ApplyHit(a_player, ev);
++						} else if (ev.type == proto::kEvNpcSwing) {
++							NpcSwing(ev);
++						} else if (ev.type == proto::kEvArrowStuck) {
++							WorldRender::StickArrow(ev.formId, ev.a, ev.b, ev.c, ev.d, std::bit_cast<float>(ev.flags));
++						}
+ 					}
+ 				}
++				UpdateNpcBows(a_delta);
+ 				pendingExplosions.clear();
+ 				pendingFlings.clear();
+-				link.WriteActors(nullptr, 0);
++				if (!riding) {
++					link.WriteActors(nullptr, 0);
++				}
+ 				return;
+ 			}
+ 			// Skyrim can't kill the player while Minecraft decides: one huge hit knocks them down
+@@ -963,6 +1092,7 @@ namespace skycraft
+ 				}
+ 			}
+ 			UpdateFlings(a_delta);
++			UpdateNpcBows(a_delta);
+ 			for (auto it = pendingExplosions.begin(); it != pendingExplosions.end();) {
+ 				it->delay -= a_delta;
+ 				if (it->delay <= 0.0f) {

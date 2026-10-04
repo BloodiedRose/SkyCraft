@@ -1,0 +1,69 @@
+diff --git a/fabric/src/main/java/dev/skycraft/world/SkyNav.java b/fabric/src/main/java/dev/skycraft/world/SkyNav.java
+index d7c92d6..de4ebdb 100644
+--- a/fabric/src/main/java/dev/skycraft/world/SkyNav.java
++++ b/fabric/src/main/java/dev/skycraft/world/SkyNav.java
+@@ -26,7 +26,12 @@ public final class SkyNav {
+ 	/** ...and this far above its head. */
+ 	public static final double ABOVE = LEDGE + 0.7;
+ 
+-	private static final double[] TURNS = { Math.PI / 4, Math.PI / 2, 3 * Math.PI / 4 };
++	/** How far each sub-step of a step goes. A mob's own ticks move it about this much. */
++	private static final double SUBSTEP = 0.3;
++	/** A sub-step that gets at least this much of the way is not blocked: rough ground makes the collision slide a little. */
++	private static final double BLOCKED = 0.85;
++
++	private static final double[] TURNS = { Math.PI / 8, Math.PI / 4, 3 * Math.PI / 8, Math.PI / 2, 3 * Math.PI / 4 };
+ 
+ 	private SkyNav() {
+ 	}
+@@ -89,17 +94,32 @@ public final class SkyNav {
+ 		return best;
+ 	}
+ 
+-	/** One plain step: the same collision the mob will get, then the ground under where it ends up. */
++	/**
++	 * One plain step, walked the way the mob really moves: in short sub-steps, each one collided from
++	 * the height the mob has reached by then, and each one ending on the ground under it. Doing the
++	 * whole step from the starting height would treat any slope that climbs more than the step height
++	 * within it (about 27 degrees over {@link #LEAD}) as a wall, and cobbled roads and rubble, which are
++	 * a run of small ups and downs, as a row of them: the mob really goes over those a tick at a time.
++	 */
+ 	private static double walk(List<SkyTri> tris, double x, double y, double z, double radius, double height, double stepUp, double dx, double dz) {
+-		double[] moved = TriCollider.resolve(tris, x, y, z, radius, height, stepUp, true, dx, 0.0, dz);
+-		if (Math.hypot(moved[0], moved[2]) < Math.hypot(dx, dz) * 0.95) {
+-			return Double.NaN; // a wall stops it
+-		}
+-		double ground = TriCollider.groundAt(tris, x + moved[0], y, z + moved[2], stepUp);
+-		if (Double.isNaN(ground) || y - ground > MAX_DROP) {
+-			return Double.NaN; // no ground, or a cliff
++		double length = Math.hypot(dx, dz);
++		int parts = Math.max(1, (int) Math.ceil(length / SUBSTEP));
++		double sx = dx / parts, sz = dz / parts, sub = length / parts;
++		double startY = y;
++		for (int i = 0; i < parts; i++) {
++			double[] moved = TriCollider.resolve(tris, x, y, z, radius, height, stepUp, true, sx, 0.0, sz);
++			if (Math.hypot(moved[0], moved[2]) < sub * BLOCKED) {
++				return Double.NaN; // a wall stops it
++			}
++			x += moved[0];
++			z += moved[2];
++			double ground = TriCollider.groundAt(tris, x, y, z, stepUp);
++			if (Double.isNaN(ground) || y - ground > MAX_DROP || startY - ground > MAX_DROP) {
++				return Double.NaN; // no ground, or a cliff
++			}
++			y = ground;
+ 		}
+-		return ground;
++		return y;
+ 	}
+ 
+ 	/**
+@@ -187,7 +207,7 @@ public final class SkyNav {
+ 			if (straight != null) {
+ 				return straight;
+ 			}
+-			// Blocked: go round on one side, the one it last got by, 45, 90 and then 135 degrees off. Only when
++			// Blocked: go round on one side, the one it last got by, from 22 degrees off up to 135. Only when
+ 			// that whole side is closed does the other one get a try; mixing the two bounces it off the obstacle.
+ 			for (int sign = 0; sign < 2; sign++) {
+ 				double dir = sign == 0 ? this.side : -this.side;

@@ -1,0 +1,114 @@
+diff --git a/skse/src/Input.cpp b/skse/src/Input.cpp
+index 854647c..c69cbfe 100644
+--- a/skse/src/Input.cpp
++++ b/skse/src/Input.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <SimpleIni.h>
+ 
++#include <array>
+ #include <cctype>
+ #include <chrono>
+ #include <cstdlib>
+@@ -104,6 +105,35 @@ namespace skycraft
+ 			return code;
+ 		}
+ 
++		// Whether the keyboard is Minecraft's right now: one of its screens is up (chat, commands, an
++		// anvil's name box, the inventory's search, ...), or one closed a moment ago. Everything typed
++		// then is Minecraft's, and none of it may reach Skyrim, or the letters of a command open
++		// Skyrim's map, journal and the like.
++		//
++		// The moment after a screen closes counts too: the key that closed it (Esc, Enter) is released
++		// after the screen is gone, and that release must not open Skyrim's menu either, and Minecraft's
++		// own report of its screens reaches Skyrim a frame late, so a screen's last keys arrive early.
++		constexpr auto kScreenGrace = std::chrono::milliseconds(200);
++		bool           screenWasOpen = false;
++		std::chrono::steady_clock::time_point screenClosedAt{};
++		// Keys whose press went to Minecraft while it had the keyboard. Their release is Minecraft's too,
++		// even if the screen has closed by then (the hook below drops it on its way to Skyrim's menus).
++		std::array<bool, 256> heldByMinecraft{};
++
++		bool MinecraftHasKeyboard()
++		{
++			if (State().mcScreenOpen) {
++				screenWasOpen = true;
++				return true;
++			}
++			const auto now = std::chrono::steady_clock::now();
++			if (screenWasOpen) {
++				screenWasOpen = false;
++				screenClosedAt = now;
++			}
++			return now - screenClosedAt < kScreenGrace;
++		}
++
+ 		// The toggle key was pressed: swap Minecraft's controls and Skyrim's. This only flips the
+ 		// switch (and tells Minecraft to let go of what it holds); the per-frame update does the
+ 		// rest, and says which mode it is now.
+@@ -228,6 +258,7 @@ namespace skycraft
+ 					st.skyrimMenuOpen = true;
+ 				}
+ 				const bool route = st.puppeting && !menuOpen;
++				const bool mcKeys = MinecraftHasKeyboard();
+ 
+ 				for (auto* e = *a_event; e; e = e->next) {
+ 					switch (e->GetEventType()) {
+@@ -262,7 +293,7 @@ namespace skycraft
+ 								break;
+ 							}
+ 							if (resetKey != 0 && button->GetDevice() == RE::INPUT_DEVICE::kKeyboard && button->GetIDCode() == resetKey) {
+-								if (down) {
++								if (down && !mcKeys) {  // a text box has the keyboard: it's typing, not the reset key
+ 									AskWorldReset(menuOpen);
+ 								}
+ 								break;
+@@ -272,9 +303,12 @@ namespace skycraft
+ 							}
+ 							const auto code = button->GetIDCode();
+ 							if (button->GetDevice() == RE::INPUT_DEVICE::kKeyboard) {
++								if (down) {
++									heldByMinecraft[code & 0xFF] = mcKeys;
++								}
+ 								// With a Minecraft screen up (chat, inventory, options) every key is
+ 								// Minecraft's, so typing works and Esc closes the screen.
+-								if (!st.mcScreenOpen) {
++								if (!mcKeys) {
+ 									if (IsSkyrimMenuKey(code)) {
+ 										break;  // MenuControls (see the hook below) opens Skyrim's menu
+ 									}
+@@ -311,7 +345,7 @@ namespace skycraft
+ 							break;
+ 						}
+ 					case RE::INPUT_EVENT_TYPE::kChar:
+-						if (route && st.mcScreenOpen) {
++						if (route && mcKeys) {
+ 							link.PushInput(proto::kInText, 0, static_cast<std::int32_t>(e->AsCharEvent()->keyCode));
+ 						}
+ 						break;
+@@ -336,13 +370,21 @@ namespace skycraft
+ 				}
+ 				std::vector<RE::InputEvent*> keep;
+ 				std::vector<RE::InputEvent*> all;
++				const bool                   mcKeys = MinecraftHasKeyboard();
+ 				for (auto* e = *a_event; e; e = e->next) {
+ 					all.push_back(e);
+-					if (st.mcScreenOpen) {
+-						continue;
+-					}
+ 					if (e->GetEventType() == RE::INPUT_EVENT_TYPE::kButton && e->GetDevice() == RE::INPUT_DEVICE::kKeyboard) {
+-						if (IsSkyrimMenuKey(e->AsButtonEvent()->GetIDCode())) {
++						auto*      button = e->AsButtonEvent();
++						const auto code = button->GetIDCode() & 0xFF;
++						if (heldByMinecraft[code]) {
++							// Minecraft's key (pressed while a text box or screen had the keyboard): its
++							// release is Minecraft's too, Skyrim never sees either half.
++							if (button->IsUp()) {
++								heldByMinecraft[code] = false;
++							}
++							continue;
++						}
++						if (!mcKeys && IsSkyrimMenuKey(button->GetIDCode())) {
+ 							keep.push_back(e);
+ 						}
+ 					}
